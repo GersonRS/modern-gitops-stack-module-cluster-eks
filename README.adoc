@@ -1,0 +1,576 @@
+= modern-gitops-stack-module-cluster-eks
+
+A https://modern-gitops-stack.io/[Modern GitOps Stack] module to deploy a Kubernetes cluster on Amazon Web Services EKS.
+
+This module creates https://docs.aws.amazon.com/eks/latest/userguide/managed-node-groups.html[EKS managed nodes] by default, bug also supports https://docs.aws.amazon.com/eks/latest/userguide/worker.html[self-managed node groups] by setting the variable `use_self_managed_node_groups` to `true`. It uses the Terraform https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest[module "eks" by AWS] to manage the cluster itself.
+
+The `node_groups` variable is a map of objects. Each value of the map creates a node group referenced by its label. The value object can take any input accepted by the https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest/submodules/eks-managed-node-group[eks-managed-node-group] or https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest/submodules/self-managed-node-group[self-managed-node-group] submodule.
+
+Here is an example that creates one EKS managed node group with 3 instances of type `r5a.large`, attaches them to the cluster Load Balancer(s), and customizes the base EBS volume size to 100 GB:
+
+----
+  node_groups = {
+    "my-node-group" = {
+      instance_types  = ["r5a.xlarge"]
+      min_size        = 3
+      max_size        = 3
+      desired_size    = 3
+      nlbs_attachment = true
+
+      block_device_mappings = {
+        "default" = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size = 100
+          }
+        }
+      }
+    },
+  }
+----
+
+[NOTE]
+====
+When using self-managed node groups, the instance type is instead given as a single string value instead of an array:
+
+----
+      instance_type     = "r5a.xlarge"
+----
+====
+
+TIP: You can check out available instance types on the https://aws.amazon.com/ec2/instance-types[official AWS documentation pages].
+
+Depending on the `create_public_nlb` and `create_private_nlb` variables, it creates a public and/or public Network Load Balancer(s). The node groups that have the `target_group_arns = module.my_cluster.nlb_target_groups` value set will be added as backends of the LBs. By default, the LBs only forward traffic on the ports `80` and `443`, but you can customize this using the `extra_lb_target_groups` and `extra_lb_http_tcp_listeners` variables to add other ports. Look at the `lb.tf` file in this module for the syntax.
+
+This module needs a Route 53 DNS zone in the same AWS account to create a wildcard CNAME record that points to the Network LB. The DNS zone must be passed in the `base_domain` variable. This record is used by other Modern GitOps Stack modules as default URLs for their applications.
+
+== Upgrading from versions earlier than 3.x
+
+The versions 2.x and earlier of this module created https://docs.aws.amazon.com/eks/latest/userguide/worker.html[self-managed node groups] exclusively. Upgrading to versions 3.x or later requires setting the variable `use_self_managed_node_groups` to `true` to avoid breaking existing clusters.
+
+[NOTE]
+====
+When going from self-managed node groups to EKS managed ones, note the following changes in node groups arguments:
+
+- The `instance_type` argument is replaced with `instance_types` and accepts a list of strings,
+- The `target_group_arns` argument isn't supported anymore. Instead set `nlbs_attachment = true`.
+====
+
+Switching an existing cluster to EKS managed node groups is possible, but requires manually draining the existing nodes after the new node group is created and before the old one is destroyed (by doing a `terraform apply -target <resource>` in multiple steps).
+
+== Technical Reference
+
+// BEGIN_TF_DOCS
+=== Requirements
+
+The following requirements are needed by this module:
+
+- [[requirement_terraform]] <<requirement_terraform,terraform>> (>= 1.0)
+
+- [[requirement_aws]] <<requirement_aws,aws>> (>= 4)
+
+=== Providers
+
+The following providers are used by this module:
+
+- [[provider_dns]] <<provider_dns,dns>>
+
+- [[provider_aws]] <<provider_aws,aws>> (>= 4)
+
+=== Modules
+
+The following Modules are called:
+
+==== [[module_cluster]] <<module_cluster,cluster>>
+
+Source: terraform-aws-modules/eks/aws
+
+Version: ~> 19.0
+
+==== [[module_nlb]] <<module_nlb,nlb>>
+
+Source: terraform-aws-modules/alb/aws
+
+Version: ~> 8.0
+
+==== [[module_nlb_private]] <<module_nlb_private,nlb_private>>
+
+Source: terraform-aws-modules/alb/aws
+
+Version: ~> 8.0
+
+=== Resources
+
+The following resources are used by this module:
+
+- https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_attachment[aws_autoscaling_attachment.node_groups_to_nlbs_target_groups] (resource)
+- https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record[aws_route53_record.wildcard] (resource)
+- https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/eks_cluster_auth[aws_eks_cluster_auth.cluster] (data source)
+- https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/region[aws_region.current] (data source)
+- https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/route53_zone[aws_route53_zone.this] (data source)
+- https://registry.terraform.io/providers/hashicorp/dns/latest/docs/data-sources/a_record_set[dns_a_record_set.nlb] (data source)
+- https://registry.terraform.io/providers/hashicorp/dns/latest/docs/data-sources/a_record_set[dns_a_record_set.nlb_private] (data source)
+
+=== Required Inputs
+
+The following input variables are required:
+
+==== [[input_cluster_name]] <<input_cluster_name,cluster_name>>
+
+Description: Name of the EKS cluster. Must be unique in the AWS account.
+
+Type: `string`
+
+==== [[input_vpc_id]] <<input_vpc_id,vpc_id>>
+
+Description: ID of the VPC where the cluster and nodes will be deployed.
+
+Type: `string`
+
+==== [[input_private_subnet_ids]] <<input_private_subnet_ids,private_subnet_ids>>
+
+Description: List of IDs of private subnets that the EKS instances will be attached to.
+
+Type: `list(string)`
+
+=== Optional Inputs
+
+The following input variables are optional (have default values):
+
+==== [[input_base_domain]] <<input_base_domain,base_domain>>
+
+Description: The base domain for the cluster.
+
+This module needs a Route 53 zone matching this variable with permission to create DNS records. It will create a wildcard CNAME record `*.<subdomain>.<base_domain>` that points to an Elastic Load Balancer routing ingress traffic to all cluster nodes. Such urls will be used by default by other Modern GitOps Stack modules for the applications they deploy (e.g. Argo CD, Prometheus, etc).
+
+Type: `string`
+
+Default: `null`
+
+==== [[input_subdomain]] <<input_subdomain,subdomain>>
+
+Description: The subdomain used for ingresses.
+
+Type: `string`
+
+Default: `"apps"`
+
+==== [[input_kubernetes_version]] <<input_kubernetes_version,kubernetes_version>>
+
+Description: Kubernetes `<major>.<minor>` version to use for the EKS cluster.
+
+See https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html[AWS EKS documentation] for a list of available versions.
+
+If you do not specify a value, the latest available version at creation is used and no upgrades will occur except those automatically triggered by EKS.
+
+The value can be set and increased on an existing cluster to upgrade it. *Note that this triggers a rolling replacement of the compute nodes, so all pods will be recreated*.
+
+Type: `string`
+
+Default: `null`
+
+==== [[input_cluster_endpoint_public_access_cidrs]] <<input_cluster_endpoint_public_access_cidrs,cluster_endpoint_public_access_cidrs>>
+
+Description: List of CIDR blocks which can access the Amazon EKS public API server endpoint.
+
+Type: `list(string)`
+
+Default:
+[source,json]
+----
+[
+  "0.0.0.0/0"
+]
+----
+
+==== [[input_public_subnet_ids]] <<input_public_subnet_ids,public_subnet_ids>>
+
+Description: List of IDs of public subnets the public NLB will be attached to if enabled with 'create_public_nlb'.
+
+Type: `list(string)`
+
+Default: `[]`
+
+==== [[input_aws_auth_accounts]] <<input_aws_auth_accounts,aws_auth_accounts>>
+
+Description: Additional AWS account numbers to add to the aws-auth configmap.
+
+Type: `list(string)`
+
+Default: `[]`
+
+==== [[input_aws_auth_roles]] <<input_aws_auth_roles,aws_auth_roles>>
+
+Description: Additional IAM roles to add to the aws-auth configmap.
+
+Type:
+[source,hcl]
+----
+list(object({
+    rolearn  = string
+    username = string
+    groups   = list(string)
+  }))
+----
+
+Default: `[]`
+
+==== [[input_aws_auth_users]] <<input_aws_auth_users,aws_auth_users>>
+
+Description: Additional IAM users to add to the aws-auth configmap.
+
+Type:
+[source,hcl]
+----
+list(object({
+    userarn  = string
+    username = string
+    groups   = list(string)
+  }))
+----
+
+Default: `[]`
+
+==== [[input_node_groups]] <<input_node_groups,node_groups>>
+
+Description: A map of node group configurations to be created.
+
+Type: `any`
+
+Default: `{}`
+
+==== [[input_use_self_managed_node_groups]] <<input_use_self_managed_node_groups,use_self_managed_node_groups>>
+
+Description: Whether to use self-managed node groups instead of EKS managed node groups.
+
+EKS managed node groups have the advantage of automatically draining the nodes when instances are being replaced.
+
+**You should set this variable to `true` on clusters deployed with a module earlier than v3 because it created self-managed node groups exclusively.**
+
+Changing this on an existing cluster is not supported (although it is possible with some downtime and manual fixes to the load balancer target groups).
+
+Type: `bool`
+
+Default: `false`
+
+==== [[input_create_public_nlb]] <<input_create_public_nlb,create_public_nlb>>
+
+Description: Whether to create an internet-facing NLB attached to the public subnets
+
+Type: `bool`
+
+Default: `true`
+
+==== [[input_create_private_nlb]] <<input_create_private_nlb,create_private_nlb>>
+
+Description: Whether to create an internal NLB attached the private subnets
+
+Type: `bool`
+
+Default: `false`
+
+==== [[input_nlb_attached_node_groups]] <<input_nlb_attached_node_groups,nlb_attached_node_groups>>
+
+Description: List of node_groups indexes that the NLB(s) should be attached to
+
+Type: `list(any)`
+
+Default: `[]`
+
+==== [[input_extra_lb_target_groups]] <<input_extra_lb_target_groups,extra_lb_target_groups>>
+
+Description: Additional Target Groups to attach to Network LBs.
+
+A list of maps containing key/value pairs that define the target groups. Required key/values: `name`, `backend_protocol`, `backend_port`.
+
+Type: `list(any)`
+
+Default: `[]`
+
+==== [[input_extra_lb_http_tcp_listeners]] <<input_extra_lb_http_tcp_listeners,extra_lb_http_tcp_listeners>>
+
+Description: Additional Listeners to attach to Network LBs.
+
+A list of maps describing the HTTP listeners. Required key/values: `port`, `protocol`. Optional key/values: `target_group_index` (defaults to `http_tcp_listeners[count.index]`).
+
+Type: `list(any)`
+
+Default: `[]`
+
+=== Outputs
+
+The following outputs are exported:
+
+==== [[output_cluster_name]] <<output_cluster_name,cluster_name>>
+
+Description: Name of the EKS cluster.
+
+==== [[output_base_domain]] <<output_base_domain,base_domain>>
+
+Description: The base domain for the cluster.
+
+==== [[output_cluster_oidc_issuer_url]] <<output_cluster_oidc_issuer_url,cluster_oidc_issuer_url>>
+
+Description: The URL on the EKS cluster for the OpenID Connect identity provider
+
+==== [[output_node_security_group_id]] <<output_node_security_group_id,node_security_group_id>>
+
+Description: ID of the node shared security group
+
+==== [[output_node_groups]] <<output_node_groups,node_groups>>
+
+Description: Map of attribute maps for all node groups created.
+
+==== [[output_kubernetes_host]] <<output_kubernetes_host,kubernetes_host>>
+
+Description: Endpoint for your Kubernetes API server.
+
+==== [[output_kubernetes_cluster_ca_certificate]] <<output_kubernetes_cluster_ca_certificate,kubernetes_cluster_ca_certificate>>
+
+Description: Certificate data required to communicate with the cluster.
+
+==== [[output_kubernetes_token]] <<output_kubernetes_token,kubernetes_token>>
+
+Description: Token to use to authenticate with the cluster.
+
+==== [[output_nlb_target_groups]] <<output_nlb_target_groups,nlb_target_groups>>
+
+Description: List of ARNs of Network LBs (public and/or private if enabled).
+
+==== [[output_kubernetes]] <<output_kubernetes,kubernetes>>
+
+Description: Kubernetes API endpoint and CA certificate as a structured value.
+// END_TF_DOCS
+
+=== Reference in table format 
+
+.Show tables
+[%collapsible]
+====
+// BEGIN_TF_TABLES
+= Requirements
+
+[cols="a,a",options="header,autowidth"]
+|===
+|Name |Version
+|[[requirement_terraform]] <<requirement_terraform,terraform>> |>= 1.0
+|[[requirement_aws]] <<requirement_aws,aws>> |>= 4
+|===
+
+= Providers
+
+[cols="a,a",options="header,autowidth"]
+|===
+|Name |Version
+|[[provider_dns]] <<provider_dns,dns>> |n/a
+|[[provider_aws]] <<provider_aws,aws>> |>= 4
+|===
+
+= Modules
+
+[cols="a,a,a",options="header,autowidth"]
+|===
+|Name |Source |Version
+|[[module_cluster]] <<module_cluster,cluster>> |terraform-aws-modules/eks/aws |~> 19.0
+|[[module_nlb]] <<module_nlb,nlb>> |terraform-aws-modules/alb/aws |~> 8.0
+|[[module_nlb_private]] <<module_nlb_private,nlb_private>> |terraform-aws-modules/alb/aws |~> 8.0
+|===
+
+= Resources
+
+[cols="a,a",options="header,autowidth"]
+|===
+|Name |Type
+|https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_attachment[aws_autoscaling_attachment.node_groups_to_nlbs_target_groups] |resource
+|https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route53_record[aws_route53_record.wildcard] |resource
+|https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/eks_cluster_auth[aws_eks_cluster_auth.cluster] |data source
+|https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/region[aws_region.current] |data source
+|https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/route53_zone[aws_route53_zone.this] |data source
+|https://registry.terraform.io/providers/hashicorp/dns/latest/docs/data-sources/a_record_set[dns_a_record_set.nlb] |data source
+|https://registry.terraform.io/providers/hashicorp/dns/latest/docs/data-sources/a_record_set[dns_a_record_set.nlb_private] |data source
+|===
+
+= Inputs
+
+[cols="a,a,a,a,a",options="header,autowidth"]
+|===
+|Name |Description |Type |Default |Required
+|[[input_cluster_name]] <<input_cluster_name,cluster_name>>
+|Name of the EKS cluster. Must be unique in the AWS account.
+|`string`
+|n/a
+|yes
+
+|[[input_base_domain]] <<input_base_domain,base_domain>>
+|The base domain for the cluster.
+
+This module needs a Route 53 zone matching this variable with permission to create DNS records. It will create a wildcard CNAME record `*.<subdomain>.<base_domain>` that points to an Elastic Load Balancer routing ingress traffic to all cluster nodes. Such urls will be used by default by other Modern GitOps Stack modules for the applications they deploy (e.g. Argo CD, Prometheus, etc).
+
+|`string`
+|`null`
+|no
+
+|[[input_subdomain]] <<input_subdomain,subdomain>>
+|The subdomain used for ingresses.
+|`string`
+|`"apps"`
+|no
+
+|[[input_kubernetes_version]] <<input_kubernetes_version,kubernetes_version>>
+|Kubernetes `<major>.<minor>` version to use for the EKS cluster.
+
+See https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html[AWS EKS documentation] for a list of available versions.
+
+If you do not specify a value, the latest available version at creation is used and no upgrades will occur except those automatically triggered by EKS.
+
+The value can be set and increased on an existing cluster to upgrade it. *Note that this triggers a rolling replacement of the compute nodes, so all pods will be recreated*.
+
+|`string`
+|`null`
+|no
+
+|[[input_cluster_endpoint_public_access_cidrs]] <<input_cluster_endpoint_public_access_cidrs,cluster_endpoint_public_access_cidrs>>
+|List of CIDR blocks which can access the Amazon EKS public API server endpoint.
+|`list(string)`
+|
+
+[source]
+----
+[
+  "0.0.0.0/0"
+]
+----
+
+|no
+
+|[[input_vpc_id]] <<input_vpc_id,vpc_id>>
+|ID of the VPC where the cluster and nodes will be deployed.
+|`string`
+|n/a
+|yes
+
+|[[input_private_subnet_ids]] <<input_private_subnet_ids,private_subnet_ids>>
+|List of IDs of private subnets that the EKS instances will be attached to.
+|`list(string)`
+|n/a
+|yes
+
+|[[input_public_subnet_ids]] <<input_public_subnet_ids,public_subnet_ids>>
+|List of IDs of public subnets the public NLB will be attached to if enabled with 'create_public_nlb'.
+|`list(string)`
+|`[]`
+|no
+
+|[[input_aws_auth_accounts]] <<input_aws_auth_accounts,aws_auth_accounts>>
+|Additional AWS account numbers to add to the aws-auth configmap.
+|`list(string)`
+|`[]`
+|no
+
+|[[input_aws_auth_roles]] <<input_aws_auth_roles,aws_auth_roles>>
+|Additional IAM roles to add to the aws-auth configmap.
+|
+
+[source]
+----
+list(object({
+    rolearn  = string
+    username = string
+    groups   = list(string)
+  }))
+----
+
+|`[]`
+|no
+
+|[[input_aws_auth_users]] <<input_aws_auth_users,aws_auth_users>>
+|Additional IAM users to add to the aws-auth configmap.
+|
+
+[source]
+----
+list(object({
+    userarn  = string
+    username = string
+    groups   = list(string)
+  }))
+----
+
+|`[]`
+|no
+
+|[[input_node_groups]] <<input_node_groups,node_groups>>
+|A map of node group configurations to be created.
+|`any`
+|`{}`
+|no
+
+|[[input_use_self_managed_node_groups]] <<input_use_self_managed_node_groups,use_self_managed_node_groups>>
+|Whether to use self-managed node groups instead of EKS managed node groups.
+
+EKS managed node groups have the advantage of automatically draining the nodes when instances are being replaced.
+
+**You should set this variable to `true` on clusters deployed with a module earlier than v3 because it created self-managed node groups exclusively.**
+
+Changing this on an existing cluster is not supported (although it is possible with some downtime and manual fixes to the load balancer target groups).
+
+|`bool`
+|`false`
+|no
+
+|[[input_create_public_nlb]] <<input_create_public_nlb,create_public_nlb>>
+|Whether to create an internet-facing NLB attached to the public subnets
+|`bool`
+|`true`
+|no
+
+|[[input_create_private_nlb]] <<input_create_private_nlb,create_private_nlb>>
+|Whether to create an internal NLB attached the private subnets
+|`bool`
+|`false`
+|no
+
+|[[input_nlb_attached_node_groups]] <<input_nlb_attached_node_groups,nlb_attached_node_groups>>
+|List of node_groups indexes that the NLB(s) should be attached to
+|`list(any)`
+|`[]`
+|no
+
+|[[input_extra_lb_target_groups]] <<input_extra_lb_target_groups,extra_lb_target_groups>>
+|Additional Target Groups to attach to Network LBs.
+
+A list of maps containing key/value pairs that define the target groups. Required key/values: `name`, `backend_protocol`, `backend_port`.
+
+|`list(any)`
+|`[]`
+|no
+
+|[[input_extra_lb_http_tcp_listeners]] <<input_extra_lb_http_tcp_listeners,extra_lb_http_tcp_listeners>>
+|Additional Listeners to attach to Network LBs.
+
+A list of maps describing the HTTP listeners. Required key/values: `port`, `protocol`. Optional key/values: `target_group_index` (defaults to `http_tcp_listeners[count.index]`).
+
+|`list(any)`
+|`[]`
+|no
+
+|===
+
+= Outputs
+
+[cols="a,a",options="header,autowidth"]
+|===
+|Name |Description
+|[[output_cluster_name]] <<output_cluster_name,cluster_name>> |Name of the EKS cluster.
+|[[output_base_domain]] <<output_base_domain,base_domain>> |The base domain for the cluster.
+|[[output_cluster_oidc_issuer_url]] <<output_cluster_oidc_issuer_url,cluster_oidc_issuer_url>> |The URL on the EKS cluster for the OpenID Connect identity provider
+|[[output_node_security_group_id]] <<output_node_security_group_id,node_security_group_id>> |ID of the node shared security group
+|[[output_node_groups]] <<output_node_groups,node_groups>> |Map of attribute maps for all node groups created.
+|[[output_kubernetes_host]] <<output_kubernetes_host,kubernetes_host>> |Endpoint for your Kubernetes API server.
+|[[output_kubernetes_cluster_ca_certificate]] <<output_kubernetes_cluster_ca_certificate,kubernetes_cluster_ca_certificate>> |Certificate data required to communicate with the cluster.
+|[[output_kubernetes_token]] <<output_kubernetes_token,kubernetes_token>> |Token to use to authenticate with the cluster.
+|[[output_nlb_target_groups]] <<output_nlb_target_groups,nlb_target_groups>> |List of ARNs of Network LBs (public and/or private if enabled).
+|[[output_kubernetes]] <<output_kubernetes,kubernetes>> |Kubernetes API endpoint and CA certificate as a structured value.
+|===
+// END_TF_TABLES
+====
